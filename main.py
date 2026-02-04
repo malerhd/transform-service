@@ -1,10 +1,60 @@
+# main.py
+from __future__ import annotations
+
+import os
+import json
+import base64
+import re
+from urllib.parse import urlparse
+from typing import List, Optional, Dict, Any
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
 
 from transformer import run_transform
 
+# Para "skipped" necesitamos chequear si existe el snapshot en GCS
+from google.cloud import storage
+from google.oauth2 import service_account
+
 app = FastAPI()
+
+
+# ─────────────────────────────────────────────────────────
+# GCP creds (mismo criterio que transformer.py: SERVICE_ACCOUNT_B64 o ADC)
+# ─────────────────────────────────────────────────────────
+def _get_gcp_credentials():
+    raw = (os.getenv("SERVICE_ACCOUNT_B64") or "").strip()
+    if not raw:
+        return None  # ADC
+
+    try:
+        if raw.lstrip().startswith("{"):
+            info = json.loads(raw)
+        else:
+            s = re.sub(r"\s+", "", raw)
+            s += "=" * (-len(s) % 4)
+            info = json.loads(base64.b64decode(s).decode("utf-8"))
+        return service_account.Credentials.from_service_account_info(info)
+    except Exception as e:
+        raise RuntimeError(f"SERVICE_ACCOUNT_B64 inválido (JSON/Base64): {e}")
+
+
+def _parse_gcs_uri(gcs_path: str) -> tuple[str, str]:
+    u = urlparse(gcs_path)
+    return u.netloc, u.path.lstrip("/")
+
+
+def gcs_exists(gcs_path: str) -> bool:
+    """
+    Devuelve True si el objeto existe en GCS.
+    Esto permite marcar "skipped" cuando un cliente no tiene esa plataforma.
+    """
+    bucket, blob_path = _parse_gcs_uri(gcs_path)
+    creds = _get_gcp_credentials()
+    sc = storage.Client(credentials=creds) if creds else storage.Client()
+    return sc.bucket(bucket).blob(blob_path).exists(sc)
+
 
 # ─────────────────────────────────────────────────────────
 # Endpoint actual: 1 plataforma (se mantiene)
@@ -19,6 +69,7 @@ class TransformRequest(BaseModel):
 @app.post("/transform")
 def transform(req: TransformRequest):
     try:
+        # (Opcional) también podés marcar skipped acá si querés.
         rows = run_transform(
             gcs_path=req.gcs_path,
             client_key=req.client_key,
@@ -36,7 +87,7 @@ def transform(req: TransformRequest):
 
 
 # ─────────────────────────────────────────────────────────
-# NUEVO: /transform_all (múltiples plataformas)
+# NUEVO: /transform_all (múltiples plataformas) + "skipped"
 # Ajustado a nombres reales en GCS
 # ─────────────────────────────────────────────────────────
 
@@ -78,14 +129,10 @@ SOURCE_MAP = {
     "GBP": "googleBusiness",
     "googlebusiness": "googleBusiness",
     "googleBusiness": "googleBusiness",
-
-    # (Si en el futuro vuelve GA4 como folder "ga" u otro, se agrega acá)
-    # "GA4": "ga",
-    # "Google Analytics": "ga",
 }
 
 # Por defecto: si no querés transformar algunas
-EXCLUDE_DEFAULT = set()  # ej: {"google-ads"} si quisieras apagarla
+EXCLUDE_DEFAULT = set()  # ej: {"google-ads"}
 
 
 def _normalize_platform(p: str) -> Optional[str]:
@@ -93,12 +140,12 @@ def _normalize_platform(p: str) -> Optional[str]:
         return None
     p = str(p).strip()
 
-    # match directo (case-sensitive) y luego flexible
+    # match directo
     if p in SOURCE_MAP:
         return SOURCE_MAP[p]
 
+    # match por lower-case contra keys lower-case
     low = p.lower().strip()
-    # intentamos matchear por lower-case contra keys lower-case
     for k, v in SOURCE_MAP.items():
         if k.lower() == low:
             return v
@@ -132,16 +179,17 @@ def transform_all(req: TransformAllRequest):
         exclude = {x.lower().strip() for x in (req.exclude or [])}
         exclude |= {x.lower() for x in EXCLUDE_DEFAULT}
 
-        # normalizar + filtrar + dedupe con orden
+        # Normalizar + filtrar + dedupe con orden
         wanted: List[str] = []
         seen = set()
 
         for item in raw:
-            plat = _normalize_platform(item) or _normalize_platform(str(item).lower())
+            # Si viene ya como slug (p.ej. "googleBusiness"), esto igual lo resuelve
+            plat = _normalize_platform(item) or _normalize_platform(str(item).lower()) or str(item).strip()
             if not plat:
                 continue
 
-            # excluir por el nombre humano o por el slug final
+            # Excluir por el nombre humano o por el slug final
             if str(item).lower().strip() in exclude or plat.lower() in exclude:
                 continue
 
@@ -150,26 +198,79 @@ def transform_all(req: TransformAllRequest):
                 seen.add(plat)
 
         results: List[Dict[str, Any]] = []
+        done_count = 0
+        skipped_count = 0
+        error_count = 0
+
         for plat in wanted:
             gcs_path = f"gs://{req.bucket}/{req.client_key}/{plat}/snapshot-latest.json"
+
+            # Si no existe el snapshot, lo marca como "skipped"
+            try:
+                if not gcs_exists(gcs_path):
+                    skipped_count += 1
+                    results.append({
+                        "platform": plat,
+                        "ok": True,
+                        "status": "skipped",
+                        "rows_upserted": 0,
+                        "gcs_path": gcs_path,
+                        "reason": "snapshot_not_found",
+                    })
+                    continue
+            except Exception as e:
+                # Si falla el exists (credenciales, permisos, etc.), devuelve error explícito
+                error_count += 1
+                results.append({
+                    "platform": plat,
+                    "ok": False,
+                    "status": "error",
+                    "error": f"gcs_exists_failed: {e}",
+                    "gcs_path": gcs_path,
+                })
+                continue
+
+            # Existe snapshot => transforma
             try:
                 rows = run_transform(
                     gcs_path=gcs_path,
                     client_key=req.client_key,
-                    platform=plat,  # OJO: acá llega el slug/folder real
+                    platform=plat,  # slug/folder real
                     project_id=req.project_id,
                 )
-                results.append({"platform": plat, "rows_upserted": rows, "ok": True})
+                done_count += 1
+                results.append({
+                    "platform": plat,
+                    "ok": True,
+                    "status": "done",
+                    "rows_upserted": rows,
+                    "gcs_path": gcs_path,
+                })
             except Exception as e:
-                results.append({"platform": plat, "ok": False, "error": str(e)})
+                error_count += 1
+                results.append({
+                    "platform": plat,
+                    "ok": False,
+                    "status": "error",
+                    "error": str(e),
+                    "gcs_path": gcs_path,
+                })
 
         return {
             "status": "ok",
             "client_key": req.client_key,
             "project_id": req.project_id,
+            "summary": {
+                "requested": len(raw),
+                "normalized_unique": len(wanted),
+                "done": done_count,
+                "skipped": skipped_count,
+                "errors": error_count,
+            },
             "results": results,
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
