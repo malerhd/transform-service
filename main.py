@@ -6,9 +6,8 @@ from transformer import run_transform
 
 app = FastAPI()
 
-
 # ─────────────────────────────────────────────────────────
-# Endpoint actual: 1 plataforma
+# Endpoint actual: 1 plataforma (se mantiene)
 # ─────────────────────────────────────────────────────────
 class TransformRequest(BaseModel):
     client_key: str
@@ -37,28 +36,56 @@ def transform(req: TransformRequest):
 
 
 # ─────────────────────────────────────────────────────────
-# NUEVO: Transformar múltiples plataformas en 1 llamada
+# NUEVO: /transform_all (múltiples plataformas)
+# Ajustado a nombres reales en GCS
 # ─────────────────────────────────────────────────────────
 
+# Mapea lo que puede venir en syncedSources (humano) -> folder/slug en GCS
 SOURCE_MAP = {
+    # Finanzas
     "BCRA": "bcra",
-    "Google Analytics": "ga",
-    "GA4": "ga",
-    "Google Merchant": "merchant",
-    "Merchant": "merchant",
+    "bcra": "bcra",
+
+    # Social / Ads
     "Meta Ads": "meta-ads",
     "Meta": "meta-ads",
-    "Instagram": "ig",
-    "IG": "ig",
-    "Tienda Nube": "tn",
-    "TiendaNube": "tn",
-    "TN": "tn",
+    "meta-ads": "meta-ads",
+
+    "Instagram": "instagram",
+    "IG": "instagram",
+    "ig": "instagram",
+    "instagram": "instagram",
+
     "TikTok": "tiktok",
     "Tiktok": "tiktok",
-    # "Google Ads": "google-ads"  # por ahora lo excluimos
+    "tiktok": "tiktok",
+
+    # Ecom / Merchant
+    "Google Merchant": "merchant",
+    "Merchant": "merchant",
+    "merchant": "merchant",
+
+    "Tienda Nube": "tiendanube",
+    "TiendaNube": "tiendanube",
+    "tiendanube": "tiendanube",
+
+    # Google
+    "Google Ads": "google-ads",
+    "google-ads": "google-ads",
+
+    "Google Business": "googleBusiness",
+    "Google Business Profile": "googleBusiness",
+    "GBP": "googleBusiness",
+    "googlebusiness": "googleBusiness",
+    "googleBusiness": "googleBusiness",
+
+    # (Si en el futuro vuelve GA4 como folder "ga" u otro, se agrega acá)
+    # "GA4": "ga",
+    # "Google Analytics": "ga",
 }
 
-EXCLUDE_DEFAULT = {"google ads", "google-ads", "gads"}
+# Por defecto: si no querés transformar algunas
+EXCLUDE_DEFAULT = set()  # ej: {"google-ads"} si quisieras apagarla
 
 
 def _normalize_platform(p: str) -> Optional[str]:
@@ -66,32 +93,25 @@ def _normalize_platform(p: str) -> Optional[str]:
         return None
     p = str(p).strip()
 
-    # mapeo por nombre “humano”
+    # match directo (case-sensitive) y luego flexible
     if p in SOURCE_MAP:
         return SOURCE_MAP[p]
 
-    # si ya viene “normalizado”
     low = p.lower().strip()
-    aliases = {
-        "meta-ads": "meta-ads",
-        "ga": "ga",
-        "tn": "tn",
-        "ig": "ig",
-        "bcra": "bcra",
-        "merchant": "merchant",
-        "tiktok": "tiktok",
-        "google ads": "google-ads",
-        "google-ads": "google-ads",
-    }
-    return aliases.get(low)
+    # intentamos matchear por lower-case contra keys lower-case
+    for k, v in SOURCE_MAP.items():
+        if k.lower() == low:
+            return v
+
+    return None
 
 
 class TransformAllRequest(BaseModel):
     client_key: str
     project_id: str
-    # podés mandar cualquiera de las dos:
+    # Podés mandar cualquiera de las dos:
     syncedSources: Optional[List[str]] = None
-    platforms: Optional[List[str]] = None
+    platforms: Optional[List[str]] = None  # si ya vienen normalizadas / slugs
     exclude: Optional[List[str]] = None
     bucket: str = "loopi-data-dev"
 
@@ -104,23 +124,25 @@ def transform_all(req: TransformAllRequest):
             return {
                 "status": "ok",
                 "client_key": req.client_key,
+                "project_id": req.project_id,
                 "results": [],
                 "note": "No platforms provided",
             }
 
         exclude = {x.lower().strip() for x in (req.exclude or [])}
-        exclude |= EXCLUDE_DEFAULT
+        exclude |= {x.lower() for x in EXCLUDE_DEFAULT}
 
         # normalizar + filtrar + dedupe con orden
         wanted: List[str] = []
         seen = set()
+
         for item in raw:
-            plat = _normalize_platform(item)
+            plat = _normalize_platform(item) or _normalize_platform(str(item).lower())
             if not plat:
                 continue
 
-            # excluir por nombre humano o por slug
-            if item.lower().strip() in exclude or plat.lower() in exclude:
+            # excluir por el nombre humano o por el slug final
+            if str(item).lower().strip() in exclude or plat.lower() in exclude:
                 continue
 
             if plat not in seen:
@@ -134,12 +156,11 @@ def transform_all(req: TransformAllRequest):
                 rows = run_transform(
                     gcs_path=gcs_path,
                     client_key=req.client_key,
-                    platform=plat,
+                    platform=plat,  # OJO: acá llega el slug/folder real
                     project_id=req.project_id,
                 )
                 results.append({"platform": plat, "rows_upserted": rows, "ok": True})
             except Exception as e:
-                # seguimos con las demás
                 results.append({"platform": plat, "ok": False, "error": str(e)})
 
         return {
@@ -151,3 +172,4 @@ def transform_all(req: TransformAllRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
